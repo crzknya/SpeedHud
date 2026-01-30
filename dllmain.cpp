@@ -1,4 +1,4 @@
-﻿#include <Windows.h>
+#include <Windows.h>
 #include <thread>
 #include <d3d11.h>
 #include <dxgi.h>
@@ -8,7 +8,7 @@
 #include <atomic>
 #include <vector>      
 #include <Psapi.h>     
-
+#include <filesystem> 
 #include "MinHook.h"
 #include "imgui.h"
 #include "imgui_impl_win32.h"
@@ -47,6 +47,8 @@ bool g_HudPosInitialized = false;
 
 // INI
 std::string g_IniPath;
+std::string g_DllDirectory;  // Added to store DLL directory
+std::string g_FontFile;      // Font file name from config
 
 // Cached module handle
 HMODULE g_GameModule = nullptr;
@@ -77,6 +79,13 @@ std::thread g_TimelapseThread;
 // Hotkey state (using VK codes for simplicity)
 constexpr int HOTKEY_FREEZE_TIME = VK_F1;      // F1 - Toggle freeze time
 constexpr int HOTKEY_TIMELAPSE = VK_F2;         // F2 - Toggle timelapse
+
+// ----------------------------
+// FORWARD DECLARATIONS
+// ----------------------------
+void StopTimelapse();
+void ToggleFreezeTime();
+void ToggleTimelapse();
 
 // ----------------------------
 // UTILITY FUNCTIONS
@@ -113,7 +122,8 @@ void CreateDefaultConfig()
             "PosY=10\n"
             "Scale=3.0\n"
             "ShowSpeed=1\n"
-            "ShowDistance=1\n";
+            "ShowDistance=1\n"
+            "FontFile=\n";
     }
 }
 
@@ -123,7 +133,7 @@ void LoadConfig()
     if (!f.good())
         CreateDefaultConfig();
 
-    char buffer[32];
+    char buffer[256];
 
     GetPrivateProfileStringA("HUD", "PosX", "10", buffer, sizeof(buffer), g_IniPath.c_str());
     g_HudPos.x = static_cast<float>(atof(buffer));
@@ -139,6 +149,9 @@ void LoadConfig()
 
     GetPrivateProfileStringA("HUD", "ShowDistance", "1", buffer, sizeof(buffer), g_IniPath.c_str());
     g_ShowDistance = (buffer[0] == '1');
+
+    GetPrivateProfileStringA("HUD", "FontFile", "", buffer, sizeof(buffer), g_IniPath.c_str());
+    g_FontFile = buffer;
 }
 
 void SaveConfig()
@@ -166,6 +179,108 @@ inline bool HandleDebouncedInput(int vkey, float currentTime)
         return true;
     }
     return false;
+}
+
+// ----------------------------
+// FONT LOADING FUNCTIONS
+// ----------------------------
+
+// Find TTF file based on config or search directory
+std::string FindTTFFile(const std::string& directory)
+{
+    namespace fs = std::filesystem;
+
+    // Create path to speedfonts folder
+    std::string fontDir = directory + "\\speedfonts";
+
+    // First, check if a specific font is specified in config
+    if (!g_FontFile.empty())
+    {
+        // Build full path in speedfonts folder
+        std::string fullPath = fontDir + "\\" + g_FontFile;
+
+        try
+        {
+            if (fs::exists(fullPath) && fs::is_regular_file(fullPath))
+            {
+                std::string extension = fs::path(fullPath).extension().string();
+                std::transform(extension.begin(), extension.end(), extension.begin(), ::tolower);
+
+                if (extension == ".ttf")
+                {
+                    return fullPath;
+                }
+            }
+        }
+        catch (...)
+        {
+            // If check fails, fall through to auto-detection
+        }
+    }
+
+    // If no font specified in config or file doesn't exist, search for any .ttf file in speedfonts folder
+    try
+    {
+        // Check if speedfonts directory exists
+        if (!fs::exists(fontDir) || !fs::is_directory(fontDir))
+        {
+            return "";  // No speedfonts folder, return empty
+        }
+
+        for (const auto& entry : fs::directory_iterator(fontDir))
+        {
+            if (entry.is_regular_file())
+            {
+                std::string extension = entry.path().extension().string();
+                // Convert extension to lowercase for case-insensitive comparison
+                std::transform(extension.begin(), extension.end(), extension.begin(), ::tolower);
+
+                if (extension == ".ttf")
+                {
+                    return entry.path().string();
+                }
+            }
+        }
+    }
+    catch (...)
+    {
+        // If directory iteration fails, return empty string
+    }
+
+    return "";
+}
+
+// Load custom font or default with anti-aliasing
+void LoadImGuiFont()
+{
+    ImGuiIO& io = ImGui::GetIO();
+
+    // Try to find a .ttf file in the DLL directory
+    std::string ttfPath = FindTTFFile(g_DllDirectory);
+
+    if (!ttfPath.empty())
+    {
+        // Load custom TTF font
+        // Using a reasonable default size, you can adjust this
+        ImFont* font = io.Fonts->AddFontFromFileTTF(ttfPath.c_str(), 16.0f);
+
+        if (font != nullptr)
+        {
+            // Font loaded successfully
+            io.Fonts->Build();
+            return;
+        }
+        // If loading failed, fall through to default font
+    }
+
+    // Use default font with anti-aliasing (smoothened)
+    ImFontConfig fontConfig;
+    fontConfig.OversampleH = 3;  // Horizontal oversampling for smoother fonts
+    fontConfig.OversampleV = 2;  // Vertical oversampling
+    fontConfig.PixelSnapH = false;  // Don't snap to pixel grid for smoother appearance
+
+    io.Fonts->AddFontDefault(&fontConfig);
+    io.Fonts->Build();
 }
 
 // ----------------------------
@@ -268,27 +383,58 @@ void SetTOD(float time)
     *(float*)valueAddress = time;
 }
 
-void TimelapseThread()
+void TimelapseThreadFunction()
 {
-    float currentTime = GetCurrentTOD();
+    g_TimelapseThreadRunning.store(true);
 
-    while (g_TimelapseThreadRunning.load())
+    while (g_IsTimelapsing)
     {
-        SetTOD(currentTime);
-        Sleep(10);
-        currentTime += 0.03f;
-        if (currentTime > 24.0f)
-            currentTime -= 24.0f;
+        float currentTime = GetCurrentTOD();
+        float newTime = currentTime + 0.05f;  // Speed of timelapse
+        if (newTime >= 24.0f)
+            newTime -= 24.0f;
+
+        SetTOD(newTime);
+        std::this_thread::sleep_for(std::chrono::milliseconds(16));  // ~60 FPS
     }
+
+    g_TimelapseThreadRunning.store(false);
 }
 
-void StartTimelapse()
+void ToggleFreezeTime()
+{
+    if (g_IsTimelapsing)
+    {
+        // Stop timelapse first
+        g_IsTimelapsing = false;
+        if (g_TimelapseThread.joinable())
+            g_TimelapseThread.join();
+    }
+
+    if (g_IsTimePassing)
+        StopTODTicker();
+    else
+        ResumeTODTicker();
+}
+
+void ToggleTimelapse()
 {
     if (!g_IsTimelapsing)
     {
+        // Start timelapse
+        if (g_IsTimePassing)
+            StopTODTicker();
+
         g_IsTimelapsing = true;
-        g_TimelapseThreadRunning.store(true);
-        g_TimelapseThread = std::thread(TimelapseThread);
+        if (g_TimelapseThread.joinable())
+            g_TimelapseThread.join();
+
+        g_TimelapseThread = std::thread(TimelapseThreadFunction);
+    }
+    else
+    {
+        // Stop timelapse
+        StopTimelapse();
     }
 }
 
@@ -296,61 +442,38 @@ void StopTimelapse()
 {
     if (g_IsTimelapsing)
     {
-        g_TimelapseThreadRunning.store(false);
+        g_IsTimelapsing = false;
         if (g_TimelapseThread.joinable())
             g_TimelapseThread.join();
-        g_IsTimelapsing = false;
-    }
-}
-
-void ToggleFreezeTime()
-{
-    if (g_IsTimePassing)
-    {
-        StopTODTicker();
-    }
-    else
-    {
-        ResumeTODTicker();
-    }
-}
-
-void ToggleTimelapse()
-{
-    if (g_IsTimelapsing)
-    {
-        StopTimelapse();
-    }
-    else
-    {
-        StartTimelapse();
     }
 }
 
 // ----------------------------
-// PRESENT HOOK
-// ----------------------------
+extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
+
 HRESULT __stdcall hkPresent(IDXGISwapChain* swapChain, UINT sync, UINT flags)
 {
     if (!g_ImGuiInitialized.load(std::memory_order_acquire))
     {
-        if (SUCCEEDED(swapChain->GetDevice(__uuidof(ID3D11Device), (void**)&g_Device)))
+        if (SUCCEEDED(swapChain->GetDevice(IID_PPV_ARGS(&g_Device))))
         {
             g_Device->GetImmediateContext(&g_Context);
 
-            DXGI_SWAP_CHAIN_DESC desc;
-            swapChain->GetDesc(&desc);
-
-            ImGui::CreateContext();
-            ImGui_ImplWin32_Init(desc.OutputWindow);
-            ImGui_ImplDX11_Init(g_Device, g_Context);
+            DXGI_SWAP_CHAIN_DESC sd;
+            swapChain->GetDesc(&sd);
 
             CreateRenderTarget(swapChain);
 
-            // Cache game module handle
-            g_GameModule = GetModuleHandle(nullptr);
+            ImGui::CreateContext();
+            ImGuiIO& io = ImGui::GetIO();
+            io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
 
-            // Get DLL path for INI
+            ImGui_ImplWin32_Init(sd.OutputWindow);
+            ImGui_ImplDX11_Init(g_Device, g_Context);
+
+            g_GameModule = GetModuleHandleA(nullptr);
+
+            // Get DLL directory and INI path
             char dllPath[MAX_PATH];
             HMODULE hModule = nullptr;
             GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
@@ -361,11 +484,16 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* swapChain, UINT sync, UINT flags)
             size_t pos = path.find_last_of("\\/");
             if (pos != std::string::npos)
             {
-                path = path.substr(0, pos) + "\\speedhud.ini";
+                g_DllDirectory = path.substr(0, pos);
+                g_IniPath = g_DllDirectory + "\\speedhud.ini";
             }
-            g_IniPath = std::move(path);
 
+            // Load config first to get font file setting
             LoadConfig();
+
+            // Load custom font or default smoothened font
+            LoadImGuiFont();
+
             g_ImGuiInitialized.store(true, std::memory_order_release);
         }
     }
@@ -398,6 +526,8 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* swapChain, UINT sync, UINT flags)
         }
 
         ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0, 0, 0, 0));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
         ImGui::Begin("##HUD", nullptr,
             ImGuiWindowFlags_NoTitleBar |
             ImGuiWindowFlags_NoResize |
@@ -405,7 +535,8 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* swapChain, UINT sync, UINT flags)
             ImGuiWindowFlags_NoMove |
             ImGuiWindowFlags_NoSavedSettings |
             ImGuiWindowFlags_NoNav |
-            ImGuiWindowFlags_NoInputs);
+            ImGuiWindowFlags_NoInputs |
+            ImGuiWindowFlags_NoBackground);
 
         ImGui::SetWindowFontScale(g_HudFontScale);
 
@@ -430,7 +561,7 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* swapChain, UINT sync, UINT flags)
             hudText = buffer;
         }
 
- 
+
 
         if (!hudText.empty())
             ImGui::TextUnformatted(hudText.c_str());
@@ -438,6 +569,7 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* swapChain, UINT sync, UINT flags)
         ImVec2 textSize = ImGui::GetWindowSize();
         ImGui::SetWindowFontScale(1.0f);
         ImGui::End();
+        ImGui::PopStyleVar(2); // Pop WindowPadding and WindowBorderSize
         ImGui::PopStyleColor();
 
         // Menu toggle
@@ -459,7 +591,7 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* swapChain, UINT sync, UINT flags)
                 ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f),
                 ImGuiCond_Once, ImVec2(0.5f, 0.5f));
 
-            ImGui::Begin("HUD & Time Control Settings", &g_ShowMenu,
+            ImGui::Begin("Settings", &g_ShowMenu,
                 ImGuiWindowFlags_AlwaysAutoResize |
                 ImGuiWindowFlags_NoCollapse);
 
