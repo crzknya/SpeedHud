@@ -7,8 +7,10 @@
 #include <fstream>
 #include <atomic>
 #include <vector>      
+#include <map>         
 #include <Psapi.h>     
-#include <filesystem> 
+#include <filesystem>
+
 #include "MinHook.h"
 #include "imgui.h"
 #include "imgui_impl_win32.h"
@@ -31,7 +33,7 @@ ID3D11RenderTargetView* g_RTV = nullptr;
 std::atomic<bool> g_ImGuiInitialized(false);
 
 // HUD
-constexpr uintptr_t g_SpeedAddress = 0x2A869AC;
+constexpr uintptr_t g_SpeedAddress = 0x2A856CC;
 
 // HUD state
 bool g_ShowSpeed = true;
@@ -53,9 +55,8 @@ std::string g_FontFile;      // Font file name from config
 // Cached module handle
 HMODULE g_GameModule = nullptr;
 
-// Input debouncing
-constexpr float INPUT_DEBOUNCE_TIME = 0.15f;
-float g_LastInputTime = 0.0f;
+// Input debouncing - track previous key states
+std::map<int, bool> g_PrevKeyStates;
 
 // ----------------------------
 // TIME CONTROL GLOBALS
@@ -68,7 +69,7 @@ constexpr const char* TODTickRevertPattern = "90 90 90 90 90 90 90 90 90 F3 0F 1
 constexpr BYTE TODTickRevertPatch[] = { 0xF3, 0x41, 0x0F, 0x11, 0x95, 0x38, 0x01, 0x00, 0x00 };
 
 constexpr uintptr_t TODOffset = 0x138;
-constexpr uintptr_t TODPointer = 0x02A588F8;
+constexpr uintptr_t TODPointer = 0x02A87678;
 
 // Time control state
 bool g_IsTimePassing = true;
@@ -171,14 +172,14 @@ void SaveConfig()
     WritePrivateProfileStringA("HUD", "ShowDistance", g_ShowDistance ? "1" : "0", g_IniPath.c_str());
 }
 
-inline bool HandleDebouncedInput(int vkey, float currentTime)
+inline bool HandleDebouncedInput(int vkey)
 {
-    if ((GetAsyncKeyState(vkey) & 1) && (currentTime - g_LastInputTime > INPUT_DEBOUNCE_TIME))
-    {
-        g_LastInputTime = currentTime;
-        return true;
-    }
-    return false;
+    bool currentState = (GetAsyncKeyState(vkey) & 0x8000) != 0;
+    bool prevState = g_PrevKeyStates[vkey];
+    g_PrevKeyStates[vkey] = currentState;
+
+    // Return true only on the down edge (key just pressed, not held)
+    return currentState && !prevState;
 }
 
 // ----------------------------
@@ -421,9 +422,9 @@ void ToggleTimelapse()
 {
     if (!g_IsTimelapsing)
     {
-        // Start timelapse
-        if (g_IsTimePassing)
-            StopTODTicker();
+        // Start timelapse - ensure time is running normally first
+        if (!g_IsTimePassing)
+            ResumeTODTicker();
 
         g_IsTimelapsing = true;
         if (g_TimelapseThread.joinable())
@@ -433,8 +434,10 @@ void ToggleTimelapse()
     }
     else
     {
-        // Stop timelapse
-        StopTimelapse();
+        // Stop timelapse - resume normal time
+        g_IsTimelapsing = false;
+        if (g_TimelapseThread.joinable())
+            g_TimelapseThread.join();
     }
 }
 
@@ -515,43 +518,18 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* swapChain, UINT sync, UINT flags)
         g_DistanceMeters += speedMps * io.DeltaTime;
 
         // HUD rendering
-        if (!g_HudPosInitialized)
-        {
-            ImGui::SetNextWindowPos(g_HudPos, ImGuiCond_Once);
-            g_HudPosInitialized = true;
-        }
-        else
-        {
-            ImGui::SetNextWindowPos(g_HudPos, ImGuiCond_Always);
-        }
-
-        ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0, 0, 0, 0));
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
-        ImGui::Begin("##HUD", nullptr,
-            ImGuiWindowFlags_NoTitleBar |
-            ImGuiWindowFlags_NoResize |
-            ImGuiWindowFlags_AlwaysAutoResize |
-            ImGuiWindowFlags_NoMove |
-            ImGuiWindowFlags_NoSavedSettings |
-            ImGuiWindowFlags_NoNav |
-            ImGuiWindowFlags_NoInputs |
-            ImGuiWindowFlags_NoBackground);
-
-        ImGui::SetWindowFontScale(g_HudFontScale);
-
-        // Build HUD text
+        // Build HUD text first to know if we should render
         std::string hudText;
         if (g_ShowSpeed && g_ShowDistance)
         {
             char buffer[64];
-            snprintf(buffer, sizeof(buffer), "%.1f km/h\n%.0f m", speedKmh, g_DistanceMeters);
+            snprintf(buffer, sizeof(buffer), "%.0f km/h\n%.0f m", speedKmh, g_DistanceMeters);
             hudText = buffer;
         }
         else if (g_ShowSpeed)
         {
             char buffer[32];
-            snprintf(buffer, sizeof(buffer), "%.1f km/h", speedKmh);
+            snprintf(buffer, sizeof(buffer), "%.0f km/h", speedKmh);
             hudText = buffer;
         }
         else if (g_ShowDistance)
@@ -561,16 +539,40 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* swapChain, UINT sync, UINT flags)
             hudText = buffer;
         }
 
-
-
+        // Only render HUD window if there's text to show
+        ImVec2 textSize = ImVec2(0, 0);
         if (!hudText.empty())
-            ImGui::TextUnformatted(hudText.c_str());
+        {
+            if (!g_HudPosInitialized)
+            {
+                ImGui::SetNextWindowPos(g_HudPos, ImGuiCond_Once);
+                g_HudPosInitialized = true;
+            }
+            else
+            {
+                ImGui::SetNextWindowPos(g_HudPos, ImGuiCond_Always);
+            }
 
-        ImVec2 textSize = ImGui::GetWindowSize();
-        ImGui::SetWindowFontScale(1.0f);
-        ImGui::End();
-        ImGui::PopStyleVar(2); // Pop WindowPadding and WindowBorderSize
-        ImGui::PopStyleColor();
+            ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0, 0, 0, 0));
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+            ImGui::Begin("##HUD", nullptr,
+                ImGuiWindowFlags_NoTitleBar |
+                ImGuiWindowFlags_NoResize |
+                ImGuiWindowFlags_AlwaysAutoResize |
+                ImGuiWindowFlags_NoMove |
+                ImGuiWindowFlags_NoSavedSettings |
+                ImGuiWindowFlags_NoNav |
+                ImGuiWindowFlags_NoInputs |
+                ImGuiWindowFlags_NoBackground);
+
+            ImGui::SetWindowFontScale(g_HudFontScale);
+            ImGui::TextUnformatted(hudText.c_str());
+            textSize = ImGui::GetWindowSize();
+            ImGui::End();
+            ImGui::PopStyleVar(2); // Pop WindowPadding and WindowBorderSize
+            ImGui::PopStyleColor();
+        }
 
         // Menu toggle
         static bool wasMenuOpen = false;
@@ -595,13 +597,50 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* swapChain, UINT sync, UINT flags)
                 ImGuiWindowFlags_AlwaysAutoResize |
                 ImGuiWindowFlags_NoCollapse);
 
+            // Check which keys are currently pressed
+            bool arrowPressed = (GetAsyncKeyState(VK_LEFT) & 0x8000) || (GetAsyncKeyState(VK_RIGHT) & 0x8000) ||
+                (GetAsyncKeyState(VK_UP) & 0x8000) || (GetAsyncKeyState(VK_DOWN) & 0x8000);
+            bool ctrlPressed = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+            bool plusPressed = (GetAsyncKeyState(VK_OEM_PLUS) & 0x8000) || (GetAsyncKeyState(VK_ADD) & 0x8000);
+            bool minusPressed = (GetAsyncKeyState(VK_OEM_MINUS) & 0x8000) || (GetAsyncKeyState(VK_SUBTRACT) & 0x8000);
+            bool key0Pressed = (GetAsyncKeyState('0') & 0x8000);
+            bool key9Pressed = (GetAsyncKeyState('9') & 0x8000);
+            bool key8Pressed = (GetAsyncKeyState('8') & 0x8000);
+
+            ImVec4 activeColor = ImVec4(0.0f, 1.0f, 0.5f, 1.0f);  // Green when active
+            ImVec4 normalColor = ImVec4(1.0f, 1.0f, 1.0f, 1.0f);  // White normally
+
             ImGui::SeparatorText("HUD Controls");
-            ImGui::TextUnformatted("Arrow keys: move HUD");
-            ImGui::TextUnformatted("Ctrl +/-: scale HUD");
-            ImGui::TextUnformatted("Ctrl + 0 : Toggle speed");
-            ImGui::TextUnformatted("Ctrl + 9 : Toggle distance");
-            ImGui::TextUnformatted("Ctrl + 8 : Reset distance");
-            ImGui::TextUnformatted("Ctrl + S : Save HUD");
+
+            // Arrow keys
+            if (arrowPressed && !ctrlPressed)
+                ImGui::TextColored(activeColor, "Arrow keys: move HUD");
+            else
+                ImGui::TextUnformatted("Arrow keys: move HUD");
+
+            // Ctrl +/-
+            if (ctrlPressed && (plusPressed || minusPressed))
+                ImGui::TextColored(activeColor, "Ctrl +/-: scale HUD");
+            else
+                ImGui::TextUnformatted("Ctrl +/-: scale HUD");
+
+            // Ctrl + 0
+            if (ctrlPressed && key0Pressed)
+                ImGui::TextColored(activeColor, "Ctrl + 0 : Toggle speed");
+            else
+                ImGui::TextUnformatted("Ctrl + 0 : Toggle speed");
+
+            // Ctrl + 9
+            if (ctrlPressed && key9Pressed)
+                ImGui::TextColored(activeColor, "Ctrl + 9 : Toggle distance");
+            else
+                ImGui::TextUnformatted("Ctrl + 9 : Toggle distance");
+
+            // Ctrl + 8
+            if (ctrlPressed && key8Pressed)
+                ImGui::TextColored(activeColor, "Ctrl + 8 : Reset distance");
+            else
+                ImGui::TextUnformatted("Ctrl + 8 : Reset distance");
 
             ImGui::Spacing();
             ImGui::SeparatorText("Time Controls");
@@ -623,10 +662,8 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* swapChain, UINT sync, UINT flags)
             ImGui::End();
             io.FontGlobalScale = oldScale;
 
-            // Input handling
-            bool ctrlPressed = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
-            static float currentTime = 0.0f;
-            currentTime += io.DeltaTime;
+            // Input handling (only works when menu is open)
+            // ctrlPressed already declared above for visual feedback
 
             if (!ctrlPressed)
             {
@@ -641,29 +678,26 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* swapChain, UINT sync, UINT flags)
 
             if (ctrlPressed)
             {
-                if (HandleDebouncedInput('0', currentTime)) g_ShowSpeed = !g_ShowSpeed;
-                if (HandleDebouncedInput('9', currentTime)) g_ShowDistance = !g_ShowDistance;
-                if (HandleDebouncedInput('8', currentTime)) g_DistanceMeters = 0.0f;
-                if (HandleDebouncedInput('S', currentTime)) SaveConfig();
+                if (HandleDebouncedInput('0')) g_ShowSpeed = !g_ShowSpeed;
+                if (HandleDebouncedInput('9')) g_ShowDistance = !g_ShowDistance;
+                if (HandleDebouncedInput('8')) g_DistanceMeters = 0.0f;
 
-                if (HandleDebouncedInput(VK_OEM_PLUS, currentTime) || HandleDebouncedInput(VK_ADD, currentTime))
-                    g_HudFontScale = min(g_HudFontScale + 0.1f, 10.0f);
+                // Smooth scaling like arrow keys
+                if (GetAsyncKeyState(VK_OEM_PLUS) & 0x8000 || GetAsyncKeyState(VK_ADD) & 0x8000)
+                    g_HudFontScale = min(g_HudFontScale + 2.0f * io.DeltaTime, 10.0f);
 
-                if (HandleDebouncedInput(VK_OEM_MINUS, currentTime) || HandleDebouncedInput(VK_SUBTRACT, currentTime))
-                    g_HudFontScale = max(g_HudFontScale - 0.1f, 0.1f);
+                if (GetAsyncKeyState(VK_OEM_MINUS) & 0x8000 || GetAsyncKeyState(VK_SUBTRACT) & 0x8000)
+                    g_HudFontScale = max(g_HudFontScale - 2.0f * io.DeltaTime, 0.1f);
             }
         }
 
         // Time control hotkeys (work even when menu is closed)
-        static float hotkeyTime = 0.0f;
-        hotkeyTime += io.DeltaTime;
-
-        if (HandleDebouncedInput(HOTKEY_FREEZE_TIME, hotkeyTime))
+        if (HandleDebouncedInput(HOTKEY_FREEZE_TIME))
         {
             ToggleFreezeTime();
         }
 
-        if (HandleDebouncedInput(HOTKEY_TIMELAPSE, hotkeyTime))
+        if (HandleDebouncedInput(HOTKEY_TIMELAPSE))
         {
             ToggleTimelapse();
         }
