@@ -9,8 +9,7 @@
 #include <vector>      
 #include <map>         
 #include <Psapi.h>     
-#include <filesystem>
-
+#include <filesystem>  
 #include "MinHook.h"
 #include "imgui.h"
 #include "imgui_impl_win32.h"
@@ -38,6 +37,7 @@ constexpr uintptr_t g_SpeedAddress = 0x2A856CC;
 // HUD state
 bool g_ShowSpeed = true;
 bool g_ShowDistance = true;
+bool g_ShowDecimalSpeed = false;  // false = integer, true = decimal
 float g_DistanceMeters = 0.0f;
 
 // Menu and scale
@@ -79,7 +79,7 @@ std::thread g_TimelapseThread;
 
 // Hotkey state (using VK codes for simplicity)
 constexpr int HOTKEY_FREEZE_TIME = VK_F1;      // F1 - Toggle freeze time
-constexpr int HOTKEY_TIMELAPSE = VK_F2;         // F2 - Toggle timelapse
+constexpr int HOTKEY_TIMELAPSE = VK_F2;        // F2 - Toggle timelapse
 
 // ----------------------------
 // FORWARD DECLARATIONS
@@ -124,6 +124,7 @@ void CreateDefaultConfig()
             "Scale=3.0\n"
             "ShowSpeed=1\n"
             "ShowDistance=1\n"
+            "ShowDecimalSpeed=0\n"  
             "FontFile=\n";
     }
 }
@@ -151,6 +152,9 @@ void LoadConfig()
     GetPrivateProfileStringA("HUD", "ShowDistance", "1", buffer, sizeof(buffer), g_IniPath.c_str());
     g_ShowDistance = (buffer[0] == '1');
 
+    GetPrivateProfileStringA("HUD", "ShowDecimalSpeed", "0", buffer, sizeof(buffer), g_IniPath.c_str());
+    g_ShowDecimalSpeed = (buffer[0] == '1');
+
     GetPrivateProfileStringA("HUD", "FontFile", "", buffer, sizeof(buffer), g_IniPath.c_str());
     g_FontFile = buffer;
 }
@@ -170,6 +174,7 @@ void SaveConfig()
 
     WritePrivateProfileStringA("HUD", "ShowSpeed", g_ShowSpeed ? "1" : "0", g_IniPath.c_str());
     WritePrivateProfileStringA("HUD", "ShowDistance", g_ShowDistance ? "1" : "0", g_IniPath.c_str());
+    WritePrivateProfileStringA("HUD", "ShowDecimalSpeed", g_ShowDecimalSpeed ? "1" : "0", g_IniPath.c_str());
 }
 
 inline bool HandleDebouncedInput(int vkey)
@@ -523,13 +528,19 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* swapChain, UINT sync, UINT flags)
         if (g_ShowSpeed && g_ShowDistance)
         {
             char buffer[64];
-            snprintf(buffer, sizeof(buffer), "%.0f km/h\n%.0f m", speedKmh, g_DistanceMeters);
+            if (g_ShowDecimalSpeed)
+                snprintf(buffer, sizeof(buffer), "%.1f km/h\n%.0f m", speedKmh, g_DistanceMeters);
+            else
+                snprintf(buffer, sizeof(buffer), "%.0f km/h\n%.0f m", speedKmh, g_DistanceMeters);
             hudText = buffer;
         }
         else if (g_ShowSpeed)
         {
             char buffer[32];
-            snprintf(buffer, sizeof(buffer), "%.0f km/h", speedKmh);
+            if (g_ShowDecimalSpeed)
+                snprintf(buffer, sizeof(buffer), "%.1f km/h", speedKmh);
+            else
+                snprintf(buffer, sizeof(buffer), "%.0f km/h", speedKmh);
             hudText = buffer;
         }
         else if (g_ShowDistance)
@@ -606,6 +617,7 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* swapChain, UINT sync, UINT flags)
             bool key0Pressed = (GetAsyncKeyState('0') & 0x8000);
             bool key9Pressed = (GetAsyncKeyState('9') & 0x8000);
             bool key8Pressed = (GetAsyncKeyState('8') & 0x8000);
+            bool key7Pressed = (GetAsyncKeyState('7') & 0x8000);
 
             ImVec4 activeColor = ImVec4(0.0f, 1.0f, 0.5f, 1.0f);  // Green when active
             ImVec4 normalColor = ImVec4(1.0f, 1.0f, 1.0f, 1.0f);  // White normally
@@ -642,6 +654,12 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* swapChain, UINT sync, UINT flags)
             else
                 ImGui::TextUnformatted("Ctrl + 8 : Reset distance");
 
+            // Ctrl + 7
+            if (ctrlPressed && key7Pressed)
+                ImGui::TextColored(activeColor, "Ctrl + 7 : Toggle speed format");
+            else
+                ImGui::TextUnformatted("Ctrl + 7 : Toggle speed format");
+
             ImGui::Spacing();
             ImGui::SeparatorText("Time Controls");
             ImGui::TextUnformatted("F1 : Toggle freeze time");
@@ -650,6 +668,7 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* swapChain, UINT sync, UINT flags)
             // Status display
             ImGui::Spacing();
             ImGui::SeparatorText("Status");
+            ImGui::Text("Speed Format: %s", g_ShowDecimalSpeed ? "Decimal (25.4 km/h)" : "Integer (25 km/h)");
             ImGui::Text("Time: %s", g_IsTimePassing ? "Running" : "Frozen");
             if (!g_IsTimePassing)
             {
@@ -663,8 +682,6 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* swapChain, UINT sync, UINT flags)
             io.FontGlobalScale = oldScale;
 
             // Input handling (only works when menu is open)
-            // ctrlPressed already declared above for visual feedback
-
             if (!ctrlPressed)
             {
                 // Movement controls
@@ -681,6 +698,7 @@ HRESULT __stdcall hkPresent(IDXGISwapChain* swapChain, UINT sync, UINT flags)
                 if (HandleDebouncedInput('0')) g_ShowSpeed = !g_ShowSpeed;
                 if (HandleDebouncedInput('9')) g_ShowDistance = !g_ShowDistance;
                 if (HandleDebouncedInput('8')) g_DistanceMeters = 0.0f;
+                if (HandleDebouncedInput('7')) g_ShowDecimalSpeed = !g_ShowDecimalSpeed;
 
                 // Smooth scaling like arrow keys
                 if (GetAsyncKeyState(VK_OEM_PLUS) & 0x8000 || GetAsyncKeyState(VK_ADD) & 0x8000)
